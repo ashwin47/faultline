@@ -1,0 +1,17 @@
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= AppConfig.db_pool %>
+
+development:
+  <<: *default
+  database: faultline_development
+  url: <%= AppConfig.database_url %>
+
+test:
+  <<: *default
+  database: faultline_test
+
+production:
+  <<: *default
+  url: <%= AppConfig.database_url %>

@@ -1,0 +1,50 @@
+# Version control
+.git
+.gitignore
+
+# Node
+node_modules/
+.pnp
+.pnp.js
+
+# Python agent (has its own Dockerfile / build context)
+agent_service/
+
+# Ruby development
+vendor/bundle
+.bundle
+
+# Build artifacts
+tmp/
+log/
+coverage/
+dist/
+build/
+*.tsbuildinfo
+.turbo/
+public/vite*
+
+# Environment files (use env_file in docker-compose)
+.env
+.env.*
+!.env.production.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Docker
+docker-compose.yml
+Dockerfile
+
+# Docs / config not needed at build
+README.md
+agents.md
+.claude/
+.rubocop.yml
+Procfile.dev
+Procfile.app

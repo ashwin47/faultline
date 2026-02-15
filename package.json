@@ -1,0 +1,47 @@
+{
+  "name": "faultline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI-powered infrastructure monitoring agent",
+  "scripts": {
+    "dev": "bin/dev",
+    "dev:backend": "bin/rails server -p 3000",
+    "dev:worker": "bundle exec sidekiq",
+    "dev:app": "foreman start -f Procfile.app",
+    "dev:agent": "cd agent_service && uv run python -m uvicorn agent.main:app --reload --port 8000",
+    "build": "vue-tsc && vite build"
+  },
+  "dependencies": {
+    "@headlessui/vue": "^1.7.22",
+    "@heroicons/vue": "^2.1.3",
+    "@iconify-json/simple-icons": "^1.2.70",
+    "@iconify/vue": "^5.0.0",
+    "@rails/actioncable": "^7.2.0",
+    "@vue-flow/background": "^1.3.2",
+    "@vue-flow/controls": "^1.1.3",
+    "@vue-flow/core": "^1.48.2",
+    "axios": "^1.7.2",
+    "camelcase-keys": "^10.0.2",
+    "markdown-it": "^14.1.0",
+    "pinia": "^2.1.7",
+    "snakecase-keys": "^9.0.2",
+    "vue": "^3.4.27",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/typography": "^0.5.19",
+    "@types/markdown-it": "^14.1.1",
+    "@types/node": "^20.14.12",
+    "@vitejs/plugin-vue": "^5.0.5",
+    "@vue/tsconfig": "^0.5.1",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.39",
+    "prettier": "^3.2.5",
+    "tailwindcss": "^3.4.4",
+    "typescript": "^5.5.4",
+    "vite": "^5.0.0",
+    "vite-plugin-ruby": "^5.1.0",
+    "vue-tsc": "^2.0.24"
+  }
+}

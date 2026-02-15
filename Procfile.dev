@@ -1,0 +1,4 @@
+web: bin/rails server -p 3000
+worker: bundle exec sidekiq
+vite: bin/vite dev
+agent: cd agent_service && uv run python -m uvicorn agent.main:app --reload --port 8000

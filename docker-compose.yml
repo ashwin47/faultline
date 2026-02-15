@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    volumes:
+      - /var/data/faultline/postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: faultline
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
+      POSTGRES_DB: faultline_production
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faultline"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - /var/data/faultline/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://faultline:${POSTGRES_PASSWORD:-faultline}@postgres:5432/faultline_production
+      REDIS_URL: redis://redis:6379/0
+      AGENT_SERVICE_URL: http://agent:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Run migrations on startup, then start the server
+    command: >
+      bash -c "
+        bin/rails db:prepare &&
+        exec bin/rails server -b 0.0.0.0
+      "
+
+  worker:
+    build: .
+    command: ["bundle", "exec", "sidekiq"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://faultline:${POSTGRES_PASSWORD:-faultline}@postgres:5432/faultline_production
+      REDIS_URL: redis://redis:6379/0
+      AGENT_SERVICE_URL: http://agent:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  agent:
+    build: ./agent_service
+    env_file: .env
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+

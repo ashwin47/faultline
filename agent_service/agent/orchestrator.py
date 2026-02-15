@@ -1,0 +1,986 @@
+"""Orchestrator agent — coordinates domain-specific sub-agents."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator
+
+from openai import AsyncOpenAI
+
+from .config import app_config
+from .investigation_context import InvestigationContext
+from .integrations.mcp.client_manager import MCPClientManager
+from .integrations.tool_registry import tool_registry
+from .integrations.aws import register_aws_tools
+from .integrations.newrelic import register_newrelic_tools
+from .integrations.pagerduty import register_pagerduty_tools
+from .name_matcher import normalize_name
+from .prompts import SYSTEM, EVALUATION_SYSTEM
+from .sub_agents import (
+    BaseSubAgent,
+    SubAgentConfig,
+    SubAgentType,
+    APMAgent,
+    ErrorMonitoringAgent,
+    InfrastructureAgent,
+    AlertingAgent,
+)
+from .models import AgentRunRequest, ResourceMap, ResourceNode
+
+logger = logging.getLogger(__name__)
+
+MAX_ORCHESTRATOR_ITERATIONS = 4
+CONFIDENCE_THRESHOLD = 60
+
+INTEGRATION_TO_AGENT: dict[str, SubAgentType] = {
+    "newrelic": "apm",
+    "error_monitoring": "error_monitoring",
+    "sentry": "error_monitoring",
+    "aws": "infrastructure",
+    "pagerduty": "alerting",
+}
+
+AGENT_CLASSES: dict[SubAgentType, type[BaseSubAgent]] = {
+    "apm": APMAgent,
+    "error_monitoring": ErrorMonitoringAgent,
+    "infrastructure": InfrastructureAgent,
+    "alerting": AlertingAgent,
+}
+
+
+def _sse_event(data: dict[str, Any]) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+
+async def orchestrate(request: AgentRunRequest) -> AsyncGenerator[str, None]:
+    """Run the multi-agent orchestration loop, yielding SSE events."""
+
+    model = request.model or app_config.openai_model
+    openai_key = request.settings.get("openai.api_key")
+
+    if not openai_key:
+        yield _sse_event({"type": "error", "error": "OpenAI API key not configured."})
+        return
+
+    client = AsyncOpenAI(api_key=openai_key)
+
+    # Register custom tools
+    tool_registry.clear()
+    register_aws_tools(resource_maps=request.resource_maps)
+    register_newrelic_tools()
+    register_pagerduty_tools()
+
+    # Initialize MCP
+    mcp = MCPClientManager(request.settings)
+    try:
+        await mcp.initialize()
+    except Exception as e:
+        logger.warning("MCP initialization error: %s", e)
+
+    # Determine enabled integrations
+    enabled_integrations = _get_enabled_integrations(request.settings)
+    mcp_stats = mcp.get_stats()
+
+    logger.info(
+        "Starting orchestration: integrations=%s, mcp_servers=%d, mcp_tools=%d, model=%s",
+        enabled_integrations,
+        mcp_stats["connectedServers"],
+        mcp_stats["totalTools"],
+        model,
+    )
+
+    yield _sse_event({"type": "thinking"})
+
+    # Build investigation context
+    user_messages = [m for m in request.messages if m.role == "user"]
+    is_follow_up = len(user_messages) > 1
+
+    if request.persisted_context:
+        ctx = InvestigationContext.from_dict(request.persisted_context)
+        if user_messages:
+            last_msg = user_messages[-1]
+            probe = InvestigationContext()
+            probe.parse_user_message(last_msg.content)
+            if probe.time_window.get("extracted"):
+                ctx.time_window = probe.time_window
+    else:
+        ctx = InvestigationContext()
+        ctx.parse_all_user_messages([{"role": m.role, "content": m.content} for m in request.messages])
+
+    # Create sub-agents
+    domain_integrations = [i for i in enabled_integrations if i != "github"]
+    base_config = SubAgentConfig(
+        client=client,
+        model=model,
+        mcp=mcp,
+        investigation_context=ctx,
+        account_id=request.account_id,
+        enabled_integrations=enabled_integrations,
+        settings=request.settings,
+    )
+
+    sub_agents: dict[SubAgentType, BaseSubAgent] = {}
+    for integration in domain_integrations:
+        agent_type = INTEGRATION_TO_AGENT.get(integration)
+        if not agent_type or agent_type not in AGENT_CLASSES:
+            continue
+        agent = AGENT_CLASSES[agent_type](base_config)
+        tools = agent.get_tools()
+        if not tools:
+            logger.warning("No tools for %s — skipping", agent_type)
+            continue
+        sub_agents[agent_type] = agent
+
+    resource_maps = request.resource_maps
+
+    try:
+        async for event_str in _run_orchestrator(
+            client, model, sub_agents, enabled_integrations, resource_maps,
+            request, ctx, is_follow_up, request.has_title,
+        ):
+            yield event_str
+    except Exception as e:
+        logger.error("Orchestrator error: %s", e, exc_info=True)
+        yield _sse_event({"type": "error", "error": str(e)})
+    finally:
+        await mcp.dispose()
+
+
+async def _run_orchestrator(
+    client: AsyncOpenAI,
+    model: str,
+    sub_agents: dict[SubAgentType, BaseSubAgent],
+    enabled_integrations: list[str],
+    resource_maps: list[ResourceMap],
+    request: AgentRunRequest,
+    ctx: InvestigationContext,
+    is_follow_up: bool,
+    has_title: bool,
+) -> AsyncGenerator[str, None]:
+    now = datetime.now(timezone.utc)
+    orchestrator_prompt = _build_orchestrator_prompt(
+        now, sub_agents, enabled_integrations, resource_maps,
+    )
+
+    # Build input items from conversation history (only text messages)
+    input_items: list[Any] = []
+    for msg in request.messages:
+        if msg.message_type != "text":
+            continue
+        content = msg.content or ""
+        if msg.role == "assistant" and msg.toolUses:
+            tool_list = msg.toolUses if isinstance(msg.toolUses, list) else [msg.toolUses]
+            tool_summaries = []
+            for t in tool_list:
+                if t.get("status") == "success":
+                    time_params = []
+                    inp = t.get("input") or {}
+                    for key in ["start_time", "end_time", "since", "from", "to", "startTime", "endTime"]:
+                        if inp.get(key):
+                            time_params.append(f"{key}={inp[key]}")
+                    tool_summaries.append(
+                        f"{t['name']}({', '.join(time_params)})" if time_params else t["name"]
+                    )
+            if tool_summaries:
+                content += f"\n\n[Tools used: {', '.join(tool_summaries)}]"
+        input_items.append({"role": msg.role, "content": content})
+
+    # Inject persisted context for follow-ups
+    if is_follow_up:
+        ctx_msg = ctx.build_context_message()
+        if ctx_msg:
+            input_items.insert(0, {
+                "role": "developer",
+                "content": f"[Persisted Investigation Context — maintain this time window unless the user explicitly changes it]\n{ctx_msg}",
+            })
+
+    # Internal tools
+    available_agent_ids = list(sub_agents.keys())
+    dispatch_tool = _build_dispatch_tool(available_agent_ids)
+    evaluate_tool = _build_evaluate_tool()
+    has_resource_maps = len(resource_maps) > 0
+    internal_tools = (
+        [_build_get_connected_resources_tool(), dispatch_tool, evaluate_tool]
+        if has_resource_maps
+        else [dispatch_tool, evaluate_tool]
+    )
+
+    total_tokens = {"input": 0, "output": 0}
+
+    # ── TRIAGE ────────────────────────────────────────────────
+    triage_result = await _triage(
+        client, model, input_items, orchestrator_prompt, internal_tools,
+        total_tokens, ctx, resource_maps, sub_agents,
+    )
+
+    if triage_result["type"] == "direct_response":
+        for chunk in triage_result.get("chunks", []):
+            yield _sse_event({"type": "text_delta", "text": chunk})
+        yield _sse_event({"type": "token_usage", **total_tokens})
+        yield _sse_event({"type": "context_update", "context": ctx.to_dict()})
+
+        # Build response message
+        response_text = triage_result.get("text", "")
+        yield _sse_event({
+            "type": "response_complete",
+            "conversationId": request.conversation_id,
+            "message": {
+                "id": _gen_id(),
+                "role": "assistant",
+                "content": response_text,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        })
+        return
+
+    # Model dispatched
+    first_dispatch_call = triage_result["dispatch_call"]
+    assignments = triage_result["assignments"]
+
+    for chunk in triage_result.get("chunks", []):
+        yield _sse_event({"type": "text_delta", "text": chunk})
+
+    input_items.append(first_dispatch_call)
+
+    # ── ORCHESTRATOR LOOP ─────────────────────────────────────
+    all_text_chunks: list[str] = []
+    all_text_chunks.extend(triage_result.get("chunks", []))
+
+    for iteration in range(MAX_ORCHESTRATOR_ITERATIONS):
+        yield _sse_event({"type": "iteration_start", "iteration": iteration})
+
+        if iteration > 0:
+            # Get new dispatch
+            dispatch_call = await _dispatch(
+                client, model, input_items, orchestrator_prompt, internal_tools,
+                total_tokens, ctx, resource_maps, sub_agents,
+            )
+            if not dispatch_call:
+                break
+
+            input_items.append(dispatch_call)
+
+            try:
+                parsed = json.loads(dispatch_call["arguments"])
+                assignments = [a for a in parsed.get("agents", []) if a["agentId"] in sub_agents]
+            except (json.JSONDecodeError, KeyError):
+                break
+
+            if not assignments:
+                break
+
+        # ── Run sub-agents ────────────────────────────────────
+        active_call_id = first_dispatch_call["call_id"] if iteration == 0 else dispatch_call["call_id"]  # noqa: F821
+        results = []
+
+        for assignment in assignments:
+            agent_id = assignment["agentId"]
+            task = assignment["task"]
+            sub_agent = sub_agents[agent_id]
+
+            yield _sse_event({
+                "type": "sub_agent_start",
+                "agentId": agent_id,
+                "agentType": sub_agent.agent_type,
+                "task": task,
+            })
+
+            try:
+                tool_queue: asyncio.Queue = asyncio.Queue()
+                agent_task = asyncio.create_task(
+                    sub_agent.run(task, on_tool_use=lambda tu: tool_queue.put_nowait(tu))
+                )
+
+                while not agent_task.done():
+                    try:
+                        tu = await asyncio.wait_for(tool_queue.get(), timeout=0.05)
+                        yield _sse_event({"type": "tool_use", "toolUse": tu})
+                    except asyncio.TimeoutError:
+                        continue
+
+                # Drain any remaining items
+                while not tool_queue.empty():
+                    yield _sse_event({"type": "tool_use", "toolUse": tool_queue.get_nowait()})
+
+                result = agent_task.result()
+                results.append(result)
+                total_tokens["input"] += result.token_usage.get("input", 0)
+                total_tokens["output"] += result.token_usage.get("output", 0)
+
+                yield _sse_event({
+                    "type": "sub_agent_complete",
+                    "agentId": result.agent_id,
+                    "findings": result.findings[:500],
+                })
+
+            except Exception as e:
+                logger.error("Sub-agent %s failed: %s", agent_id, e)
+                yield _sse_event({"type": "sub_agent_complete", "agentId": agent_id, "findings": f"Agent failed: {e}"})
+                from .sub_agents.base import SubAgentResult
+                results.append(SubAgentResult(
+                    agent_id=agent_id,
+                    findings=f"Investigation failed: {e}",
+                    tools_used=[],
+                    iterations=0,
+                    token_usage={"input": 0, "output": 0},
+                ))
+
+        # Add findings
+        findings_summary = "\n\n---\n\n".join(
+            f"## {r.agent_id} Agent Findings ({len(r.tools_used)} tools, {r.iterations} iterations)\n{r.findings}"
+            for r in results
+        )
+        input_items.append({
+            "type": "function_call_output",
+            "call_id": active_call_id,
+            "output": findings_summary,
+        })
+
+        # ── Evaluate ──────────────────────────────────────────
+        is_last = iteration >= MAX_ORCHESTRATOR_ITERATIONS - 1
+
+        if is_last:
+            input_items.append({
+                "role": "developer",
+                "content": 'This is the last orchestrator iteration. Strongly consider marking as "complete" unless critical data is clearly missing.',
+            })
+
+        evaluation = await _evaluate(client, model, input_items, orchestrator_prompt, internal_tools, total_tokens)
+
+        yield _sse_event({
+            "type": "reasoning",
+            "iteration": iteration,
+            "evaluation": evaluation["result"],
+        })
+
+        if evaluation.get("call"):
+            input_items.append(evaluation["call"])
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": evaluation["call"]["call_id"],
+                "output": f"Evaluation recorded: {evaluation['result']['status']} (confidence: {evaluation['result']['confidence']}%)",
+            })
+
+        should_complete = (
+            evaluation["result"]["status"] == "complete"
+            and evaluation["result"]["confidence"] >= CONFIDENCE_THRESHOLD
+        )
+
+        if should_complete or is_last:
+            yield _sse_event({"type": "token_usage", **total_tokens})
+
+            async for chunk in _stream_final_answer(
+                client, model, input_items, orchestrator_prompt, is_last and not should_complete,
+            ):
+                all_text_chunks.append(chunk)
+                yield _sse_event({"type": "text_delta", "text": chunk})
+
+            yield _sse_event({"type": "context_update", "context": ctx.to_dict()})
+            yield _sse_event({
+                "type": "response_complete",
+                "conversationId": request.conversation_id,
+                "message": {
+                    "id": _gen_id(),
+                    "role": "assistant",
+                    "content": "".join(all_text_chunks),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            })
+
+            # Generate title if needed
+            if not has_title:
+                async for evt in _generate_title(client, request):
+                    yield evt
+
+            return
+
+        if evaluation["result"]["status"] == "complete" and evaluation["result"]["confidence"] < CONFIDENCE_THRESHOLD:
+            input_items.append({
+                "role": "developer",
+                "content": f"[Evaluation Override] Confidence {evaluation['result']['confidence']}% is below threshold. Continue investigating. Focus on: {', '.join(evaluation['result'].get('next_steps', [])) or 'filling gaps'}",
+            })
+
+    # Exhausted iterations
+    yield _sse_event({"type": "token_usage", **total_tokens})
+    async for chunk in _stream_final_answer(client, model, input_items, orchestrator_prompt, True):
+        all_text_chunks.append(chunk)
+        yield _sse_event({"type": "text_delta", "text": chunk})
+
+    yield _sse_event({"type": "context_update", "context": ctx.to_dict()})
+    yield _sse_event({
+        "type": "response_complete",
+        "conversationId": request.conversation_id,
+        "message": {
+            "id": _gen_id(),
+            "role": "assistant",
+            "content": "".join(all_text_chunks),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+
+    if not has_title:
+        async for evt in _generate_title(client, request):
+            yield evt
+
+
+# ── Triage ────────────────────────────────────────────────────
+
+async def _triage(
+    client: AsyncOpenAI,
+    model: str,
+    input_items: list[Any],
+    system_prompt: str,
+    tools: list[Any],
+    total_tokens: dict[str, int],
+    ctx: InvestigationContext,
+    resource_maps: list[ResourceMap],
+    sub_agents: dict[SubAgentType, BaseSubAgent],
+) -> dict[str, Any]:
+    stream = await client.responses.create(
+        model=model,
+        instructions=system_prompt,
+        input=input_items,
+        tools=tools,
+        tool_choice="auto",
+        stream=True,
+    )
+
+    text_chunks: list[str] = []
+    completed_response: Any = None
+
+    async for event in stream:
+        if event.type == "response.output_text.delta":
+            text_chunks.append(event.delta)
+        elif event.type == "response.completed":
+            completed_response = event.response
+
+    if completed_response and hasattr(completed_response, "usage") and completed_response.usage:
+        total_tokens["input"] += getattr(completed_response.usage, "input_tokens", 0) or 0
+        total_tokens["output"] += getattr(completed_response.usage, "output_tokens", 0) or 0
+
+    # Check for function calls
+    connected_call = None
+    dispatch_call = None
+
+    if completed_response and hasattr(completed_response, "output"):
+        for o in completed_response.output:
+            if o.type == "function_call" and o.name == "_get_connected_resources":
+                connected_call = o
+            elif o.type == "function_call" and o.name == "_dispatch":
+                dispatch_call = o
+
+    # Handle connected resources lookup
+    if connected_call:
+        scope_result = _resolve_resource_scope(connected_call, resource_maps)
+        scope_output = _format_scope_result(scope_result)
+
+        if scope_result:
+            ctx.scope_to_resources(
+                [r.name for r in scope_result["resources"]],
+                scope_result["group_name"],
+            )
+
+        input_items.append({
+            "type": "function_call",
+            "call_id": connected_call.call_id,
+            "name": connected_call.name,
+            "arguments": connected_call.arguments,
+        })
+        input_items.append({
+            "type": "function_call_output",
+            "call_id": connected_call.call_id,
+            "output": scope_output,
+        })
+
+        if not dispatch_call:
+            follow_up = await client.responses.create(
+                model=model,
+                instructions=system_prompt,
+                input=input_items,
+                tools=tools,
+                tool_choice="auto",
+                stream=True,
+            )
+
+            follow_up_response: Any = None
+            async for event in follow_up:
+                if event.type == "response.output_text.delta":
+                    text_chunks.append(event.delta)
+                elif event.type == "response.completed":
+                    follow_up_response = event.response
+
+            if follow_up_response and hasattr(follow_up_response, "usage") and follow_up_response.usage:
+                total_tokens["input"] += getattr(follow_up_response.usage, "input_tokens", 0) or 0
+                total_tokens["output"] += getattr(follow_up_response.usage, "output_tokens", 0) or 0
+
+            if follow_up_response and hasattr(follow_up_response, "output"):
+                for o in follow_up_response.output:
+                    if o.type == "function_call" and o.name == "_dispatch":
+                        dispatch_call = o
+
+    if not dispatch_call:
+        return {"type": "direct_response", "chunks": text_chunks, "text": "".join(text_chunks)}
+
+    # Parse assignments
+    try:
+        parsed = json.loads(dispatch_call.arguments)
+        assignments = [a for a in parsed.get("agents", []) if a["agentId"] in sub_agents]
+    except (json.JSONDecodeError, KeyError):
+        return {"type": "direct_response", "chunks": text_chunks, "text": "".join(text_chunks)}
+
+    if not assignments:
+        return {"type": "direct_response", "chunks": text_chunks, "text": "".join(text_chunks)}
+
+    return {
+        "type": "dispatch",
+        "dispatch_call": {
+            "type": "function_call",
+            "call_id": dispatch_call.call_id,
+            "name": dispatch_call.name,
+            "arguments": dispatch_call.arguments,
+        },
+        "assignments": assignments,
+        "chunks": text_chunks,
+    }
+
+
+# ── Dispatch (iterations > 0) ────────────────────────────────
+
+async def _dispatch(
+    client: AsyncOpenAI,
+    model: str,
+    input_items: list[Any],
+    system_prompt: str,
+    tools: list[Any],
+    total_tokens: dict[str, int],
+    ctx: InvestigationContext,
+    resource_maps: list[ResourceMap],
+    sub_agents: dict[SubAgentType, BaseSubAgent],
+) -> dict[str, Any] | None:
+    for _ in range(3):
+        response = await client.responses.create(
+            model=model,
+            instructions=system_prompt,
+            input=input_items,
+            tools=tools,
+            tool_choice="auto",
+        )
+
+        if hasattr(response, "usage") and response.usage:
+            total_tokens["input"] += getattr(response.usage, "input_tokens", 0) or 0
+            total_tokens["output"] += getattr(response.usage, "output_tokens", 0) or 0
+
+        dispatch_call = None
+        connected_call = None
+
+        if hasattr(response, "output"):
+            for o in response.output:
+                if o.type == "function_call" and o.name == "_dispatch":
+                    dispatch_call = o
+                elif o.type == "function_call" and o.name == "_get_connected_resources":
+                    connected_call = o
+
+        if dispatch_call:
+            return {
+                "type": "function_call",
+                "call_id": dispatch_call.call_id,
+                "name": dispatch_call.name,
+                "arguments": dispatch_call.arguments,
+            }
+
+        if connected_call:
+            scope_result = _resolve_resource_scope(connected_call, resource_maps)
+            scope_output = _format_scope_result(scope_result)
+
+            if scope_result:
+                ctx.scope_to_resources(
+                    [r.name for r in scope_result["resources"]],
+                    scope_result["group_name"],
+                )
+
+            input_items.append({
+                "type": "function_call",
+                "call_id": connected_call.call_id,
+                "name": connected_call.name,
+                "arguments": connected_call.arguments,
+            })
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": connected_call.call_id,
+                "output": scope_output,
+            })
+            continue
+
+        return None
+
+    return None
+
+
+# ── Evaluate ──────────────────────────────────────────────────
+
+async def _evaluate(
+    client: AsyncOpenAI,
+    model: str,
+    input_items: list[Any],
+    system_prompt: str,
+    tools: list[Any],
+    total_tokens: dict[str, int],
+) -> dict[str, Any]:
+    eval_input = list(input_items)
+    eval_input.append({
+        "role": "developer",
+        "content": EVALUATION_SYSTEM,
+    })
+
+    response = await client.responses.create(
+        model=model,
+        instructions=system_prompt,
+        input=eval_input,
+        tools=tools,
+        tool_choice={"type": "function", "name": "_evaluate"},
+    )
+
+    if hasattr(response, "usage") and response.usage:
+        total_tokens["input"] += getattr(response.usage, "input_tokens", 0) or 0
+        total_tokens["output"] += getattr(response.usage, "output_tokens", 0) or 0
+
+    eval_call = None
+    if hasattr(response, "output"):
+        for o in response.output:
+            if o.type == "function_call" and o.name == "_evaluate":
+                eval_call = o
+
+    if not eval_call:
+        return {
+            "result": {"status": "continue", "confidence": 0, "summary": "No evaluation produced.", "next_steps": []},
+            "call": None,
+        }
+
+    try:
+        parsed = json.loads(eval_call.arguments)
+        return {
+            "result": {
+                "status": "complete" if parsed.get("status") == "complete" else "continue",
+                "confidence": min(100, max(0, parsed.get("confidence", 0))),
+                "summary": parsed.get("summary", ""),
+                "next_steps": parsed.get("next_steps", []),
+            },
+            "call": {
+                "type": "function_call",
+                "call_id": eval_call.call_id,
+                "name": eval_call.name,
+                "arguments": eval_call.arguments,
+            },
+        }
+    except (json.JSONDecodeError, KeyError):
+        return {
+            "result": {"status": "continue", "confidence": 0, "summary": "Failed to parse evaluation.", "next_steps": []},
+            "call": {
+                "type": "function_call",
+                "call_id": eval_call.call_id,
+                "name": eval_call.name,
+                "arguments": eval_call.arguments,
+            },
+        }
+
+
+# ── Final answer streaming ────────────────────────────────────
+
+async def _stream_final_answer(
+    client: AsyncOpenAI,
+    model: str,
+    input_items: list[Any],
+    system_prompt: str,
+    forced: bool,
+) -> AsyncGenerator[str, None]:
+    final_input = list(input_items)
+    final_input.append({
+        "role": "developer",
+        "content": (
+            "[Phase: Final Answer] You have reached the iteration limit. Produce your final, comprehensive answer NOW using all the data gathered by sub-agents. Do not dispatch any more tasks."
+            if forced
+            else "[Phase: Final Answer] Your evaluation determined the investigation is complete. Produce your final, comprehensive diagnosis synthesizing all evidence from sub-agents."
+        ),
+    })
+
+    stream = await client.responses.create(
+        model=model,
+        instructions=system_prompt,
+        input=final_input,
+        stream=True,
+    )
+
+    async for event in stream:
+        if event.type == "response.output_text.delta":
+            yield event.delta
+
+
+# ── Title generation ──────────────────────────────────────────
+
+async def _generate_title(
+    client: AsyncOpenAI,
+    request: AgentRunRequest,
+) -> AsyncGenerator[str, None]:
+    summary_model = app_config.openai_summary_model
+    user_msg = request.user_message
+
+    try:
+        response = await client.chat.completions.create(
+            model=summary_model,
+            messages=[
+                {"role": "system", "content": "Generate a short, descriptive title (max 60 chars) for this conversation. Return only the title, no quotes or punctuation."},
+                {"role": "user", "content": user_msg[:500]},
+            ],
+            max_tokens=30,
+        )
+        title = (response.choices[0].message.content or "").strip()
+        if title:
+            yield _sse_event({
+                "type": "title_generated",
+                "title": title,
+                "conversationId": request.conversation_id,
+            })
+    except Exception as e:
+        logger.warning("Title generation failed: %s", e)
+
+
+# ── Tool schemas ──────────────────────────────────────────────
+
+def _build_dispatch_tool(available_agent_ids: list[SubAgentType]) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "_dispatch",
+        "description": "Dispatch investigation tasks to domain-specific sub-agents.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "agents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agentId": {"type": "string", "enum": available_agent_ids},
+                            "task": {"type": "string"},
+                        },
+                        "required": ["agentId", "task"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["agents"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    }
+
+
+def _build_evaluate_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "_evaluate",
+        "description": "Evaluate whether enough data has been gathered to answer the user's question. For simple data queries (status checks, listing resources, metric lookups), successful data retrieval is sufficient. For investigations, evaluate whether a comprehensive diagnosis is possible.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["continue", "complete"]},
+                "confidence": {"type": "number"},
+                "summary": {"type": "string"},
+                "next_steps": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["status", "confidence", "summary", "next_steps"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    }
+
+
+def _build_get_connected_resources_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "_get_connected_resources",
+        "description": "Look up a resource or service name in the resource map and return all connected resources in the same group.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "resource_name": {"type": "string"},
+            },
+            "required": ["resource_name"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    }
+
+
+# ── Resource map helpers ──────────────────────────────────────
+
+def _resolve_resource_scope(
+    connected_call: Any,
+    resource_maps: list[ResourceMap],
+) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(connected_call.arguments)
+        service_name = parsed.get("resource_name", "")
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+    normalized_input = normalize_name(service_name)
+
+    for rmap in resource_maps:
+        if not rmap.groups:
+            continue
+
+        node_by_id = {n.id: n for n in rmap.nodes}
+
+        # Pass 1: exact normalized name match
+        matched_node = next(
+            (n for n in rmap.nodes if n.normalizedName == normalized_input), None
+        )
+
+        # Pass 2: substring containment
+        if not matched_node:
+            matched_node = next(
+                (n for n in rmap.nodes if normalized_input in n.normalizedName or n.normalizedName in normalized_input),
+                None,
+            )
+
+        # Pass 3: group name match
+        if not matched_node:
+            for group in rmap.groups:
+                ng = normalize_name(group.name)
+                if ng == normalized_input or normalized_input in ng or ng in normalized_input:
+                    nodes = [node_by_id[nid] for nid in group.nodeIds if nid in node_by_id]
+                    return {"group_name": group.name, "group_id": group.id, "map_name": rmap.name, "resources": nodes}
+            continue
+
+        # Find group containing matched node
+        for group in rmap.groups:
+            if matched_node.id in group.nodeIds:
+                nodes = [node_by_id[nid] for nid in group.nodeIds if nid in node_by_id]
+                return {"group_name": group.name, "group_id": group.id, "map_name": rmap.name, "resources": nodes}
+
+    return None
+
+
+def _format_scope_result(result: dict[str, Any] | None) -> str:
+    if not result:
+        return "No matching resource group found. Investigate all available resources."
+
+    lines = [
+        f'Matched group: **{result["group_name"]}** from map "{result["map_name"]}" ({len(result["resources"])} resources)',
+        "",
+        "Resources in this group:",
+    ]
+
+    for node in result["resources"]:
+        id_part = f" (id: {node.externalId})" if node.externalId else ""
+        attr_parts = ", ".join(f"{k}={v}" for k, v in node.attrs.items() if v)
+        lines.append(f"- [{node.type}] {node.name}{id_part} [{node.source}]{f' — {attr_parts}' if attr_parts else ''}")
+
+    lines.append("")
+    lines.append("Scope all dispatch tasks to ONLY these resources.")
+    return "\n".join(lines)
+
+
+def _build_orchestrator_prompt(
+    now: datetime,
+    sub_agents: dict[SubAgentType, BaseSubAgent],
+    enabled_integrations: list[str],
+    resource_maps: list[ResourceMap],
+) -> str:
+    agent_descs: dict[SubAgentType, str] = {
+        "apm": "Queries New Relic for APM metrics, throughput, error rates, response times, transaction traces, and NRQL analytics",
+        "error_monitoring": "Queries Sentry for error tracking, stack traces, issue frequency, affected users, and release correlation",
+        "infrastructure": "Queries AWS for CloudWatch metrics, EC2/ECS/Lambda health, RDS performance, log analysis, and infrastructure alarms",
+        "alerting": "Queries PagerDuty for incidents, on-call schedules, alert timelines, service status, and escalation policies",
+    }
+
+    agent_descriptions = "\n".join(
+        f"- **{agent_id}** ({agent.agent_type}): {agent_descs.get(agent_id, '')}"
+        for agent_id, agent in sub_agents.items()
+    )
+
+    resource_section = ""
+    if resource_maps:
+        resource_section = """
+
+## Resource Map
+
+Resource maps are available for this account. After your initial investigation
+reveals service or resource names, call `_get_connected_resources` with the
+service name to find all related resources (databases, APM apps, error trackers,
+alerting services) in the same group. Use the returned resources to scope
+follow-up dispatch tasks."""
+
+    return f"""{SYSTEM}
+
+# Your Role: Investigation Orchestrator
+
+You coordinate domain-specific investigation agents. You do NOT call data-source tools directly — instead you dispatch tasks to specialized sub-agents, evaluate their findings, and synthesize a comprehensive diagnosis.
+
+## When to Respond Directly
+
+For messages that do NOT require querying monitoring systems — greetings, casual conversation, clarification questions, general knowledge questions, or follow-up questions that can be answered from context already in the conversation — respond with text directly. Do NOT dispatch sub-agents for these.
+
+## When to Dispatch
+
+For ANY message that requires fetching live data from monitoring systems — whether it's a quick status check, a data query, or a full incident investigation — dispatch to the relevant sub-agents.
+
+**Simple data queries** (status checks, listing resources, metric lookups): dispatch once and produce a final answer from the results. One iteration is sufficient.
+
+**Investigations** (error diagnosis, incident analysis, performance issues): dispatch, evaluate, iterate, and synthesize a comprehensive diagnosis.
+
+## Available Sub-Agents
+
+{agent_descriptions}
+
+## How Investigation Works
+
+0. **Investigate**: Dispatch to the most relevant sub-agent first.
+1. **Scope** (when a resource map is linked): After initial findings reveal service/resource names, call `_get_connected_resources`.
+2. **Dispatch**: Use connected resources to dispatch targeted follow-up tasks.
+3. **Evaluate**: After sub-agents report back, assess completeness.
+4. **Iterate**: If gaps remain, dispatch follow-up tasks.
+5. **Synthesize**: When complete, produce a final diagnosis.
+
+## Dispatch Guidelines
+
+- Only dispatch to agents whose domain is relevant.
+- Include known context in the task: service names, time windows, error messages, resource IDs.
+- For follow-up dispatches, reference specific findings from earlier rounds.
+
+Connected integrations: {', '.join(enabled_integrations)}
+Current time: {now.isoformat()}{resource_section}"""
+
+
+# ── Helpers ───────────────────────────────────────────────────
+
+def _has_any_instance(settings: dict[str, Any], integration: str, required_suffix: str) -> bool:
+    """Check if any indexed instance of an integration has the required key set."""
+    prefix = f"{integration}."
+    for key, val in settings.items():
+        if key.startswith(prefix) and key.endswith(f".{required_suffix}") and val:
+            return True
+    return False
+
+
+def _get_enabled_integrations(settings: dict[str, Any]) -> list[str]:
+    enabled: list[str] = []
+    if _has_any_instance(settings, "newrelic", "api_key") and _has_any_instance(settings, "newrelic", "account_id"):
+        enabled.append("newrelic")
+    if _has_any_instance(settings, "sentry", "auth_token") and _has_any_instance(settings, "sentry", "org"):
+        enabled.append("sentry")
+    if _has_any_instance(settings, "aws", "access_key_id") and _has_any_instance(settings, "aws", "secret_access_key"):
+        enabled.append("aws")
+    if _has_any_instance(settings, "github", "token"):
+        enabled.append("github")
+    if _has_any_instance(settings, "pagerduty", "api_key"):
+        enabled.append("pagerduty")
+    return enabled
+
+
+def _gen_id() -> str:
+    import uuid
+    return str(uuid.uuid4())

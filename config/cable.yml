@@ -1,0 +1,12 @@
+development:
+  adapter: redis
+  url: <%= AppConfig.cable_redis_url %>
+  channel_prefix: faultline_development
+
+test:
+  adapter: test
+
+production:
+  adapter: redis
+  url: <%= AppConfig.cable_redis_url %>
+  channel_prefix: faultline_production
