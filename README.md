@@ -81,14 +81,18 @@ The Docker Compose setup runs 5 containers:
 ### Quick Start
 
 ```bash
-# 1. Configure environment
+# 1. Clone the repo
+git clone https://github.com/chatwoot/faultline.git
+cd faultline
+
+# 2. Configure environment
 cp .env.production.example .env
 # Edit .env — set SECRET_KEY_BASE, JWT_SECRET, POSTGRES_PASSWORD
 
-# 2. Create data directories
+# 3. Create data directories
 sudo mkdir -p /var/data/faultline/{postgres,redis}
 
-# 3. Build and start
+# 4. Build and start
 docker compose build
 docker compose up -d
 ```
