@@ -8,6 +8,13 @@ An open-source AI agent for infrastructure debugging. Ask questions about your i
 
 We built this at [Chatwoot](https://www.chatwoot.com) to speed up our own incident investigations. Read more at [faultline.chatwoot.com](https://faultline.chatwoot.com).
 
+<p align="center">
+  Here is a video on how it works.<br><br>
+  <a href="https://youtu.be/S1-pW_wD2uA">
+    <img src=".github/video-thumbnail.png" alt="Watch the demo" width="600">
+  </a>
+</p>
+
 ## How It Works
 
 You ask a question. The agent uses MCP (Model Context Protocol) servers and custom tools to query your integrations, iterates through the data autonomously, and returns a complete analysis.
