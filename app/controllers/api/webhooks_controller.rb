@@ -89,7 +89,7 @@ module API
         account_id,
         prompt,
         nil, # model — use default
-        [{ role: 'user', content: prompt }].to_json,
+        conversation.messages.for_agent.ordered.map(&:as_api_json).to_json,
         { persisted_context: nil, has_title: true }.to_json
       )
 
