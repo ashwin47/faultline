@@ -16,10 +16,11 @@ export interface PagerDutyCredentials {
 
 /**
  * Read PagerDuty API key from the settings database.
+ * Uses indexed key format (pagerduty.N.field). Defaults to instance 0.
  * Throws if not configured.
  */
-export function getPagerDutyCredentials(accountId: string): PagerDutyCredentials {
-  const apiKey = Setting.get(accountId, 'pagerduty.api_key');
+export function getPagerDutyCredentials(accountId: string, index = 0): PagerDutyCredentials {
+  const apiKey = Setting.get(accountId, `pagerduty.${index}.api_key`);
 
   if (!apiKey) {
     throw new Error('PagerDuty API key not configured. Please enter your API key in Settings.');

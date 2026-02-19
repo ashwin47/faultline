@@ -43,66 +43,73 @@ class MCPClientManager {
 
     // New Relic is handled by custom NerdGraph tools (see integrations/newrelic/), not MCP.
 
-    // AWS API MCP Server (stdio) - OFFICIAL package from AWS Labs
-    const awsAccessKeyId = Setting.get(this.accountId, "aws.access_key_id");
-    const awsSecretAccessKey = Setting.get(this.accountId, "aws.secret_access_key");
-    const awsRegion = Setting.get(this.accountId, "aws.region") || "us-east-1";
-
-    if (awsAccessKeyId && awsSecretAccessKey) {
-      configs.push({
-        name: "aws",
-        transport: "stdio",
-        command: "uvx",
-        args: ["awslabs.aws-api-mcp-server@latest"],
-        env: {
-          AWS_ACCESS_KEY_ID: awsAccessKeyId,
-          AWS_SECRET_ACCESS_KEY: awsSecretAccessKey,
-          AWS_REGION: awsRegion,
-        },
-      });
+    // AWS API MCP Server (stdio) — uses first configured instance
+    const awsInstances = Setting.getInstances(this.accountId, "aws");
+    if (awsInstances.length > 0) {
+      const aws = awsInstances[0];
+      if (aws.access_key_id && aws.secret_access_key) {
+        configs.push({
+          name: "aws",
+          transport: "stdio",
+          command: "uvx",
+          args: ["awslabs.aws-api-mcp-server@latest"],
+          env: {
+            AWS_ACCESS_KEY_ID: aws.access_key_id,
+            AWS_SECRET_ACCESS_KEY: aws.secret_access_key,
+            AWS_REGION: aws.region || "us-east-1",
+          },
+        });
+      }
     }
 
-    // Sentry MCP Server (stdio) - OFFICIAL package from Sentry
-    const sentryToken = Setting.get(this.accountId, "sentry.auth_token");
-    const sentryOrg = Setting.get(this.accountId, "sentry.org");
-
-    if (sentryToken && sentryOrg) {
-      configs.push({
-        name: "sentry",
-        transport: "stdio",
-        command: "npx",
-        args: ["-y", "@sentry/mcp-server", "--organization-slug", sentryOrg], // Official Sentry MCP server
-        env: {
-          SENTRY_ACCESS_TOKEN: sentryToken,
-        },
-      });
+    // Sentry MCP Server (stdio) — uses first configured instance
+    const sentryInstances = Setting.getInstances(this.accountId, "sentry");
+    if (sentryInstances.length > 0) {
+      const sentry = sentryInstances[0];
+      if (sentry.auth_token && sentry.org) {
+        configs.push({
+          name: "sentry",
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "@sentry/mcp-server", "--organization-slug", sentry.org],
+          env: {
+            SENTRY_ACCESS_TOKEN: sentry.auth_token,
+          },
+        });
+      }
     }
 
-    // GitHub MCP Server (stdio) - OFFICIAL package from Anthropic/modelcontextprotocol
-    const githubToken = Setting.get(this.accountId, "github.token");
-    if (githubToken) {
-      configs.push({
-        name: "github",
-        transport: "stdio",
-        command: "npx",
-        args: ["-y", "@modelcontextprotocol/server-github"], // Official GitHub MCP server
-        env: {
-          GITHUB_PERSONAL_ACCESS_TOKEN: githubToken,
-        },
-      });
+    // GitHub MCP Server (stdio) — uses first configured instance
+    const githubInstances = Setting.getInstances(this.accountId, "github");
+    if (githubInstances.length > 0) {
+      const github = githubInstances[0];
+      if (github.token) {
+        configs.push({
+          name: "github",
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-github"],
+          env: {
+            GITHUB_PERSONAL_ACCESS_TOKEN: github.token,
+          },
+        });
+      }
     }
 
-    // PagerDuty MCP Server (streamable-http) - PagerDuty-hosted MCP service
-    const pagerdutyKey = Setting.get(this.accountId, "pagerduty.api_key");
-    if (pagerdutyKey) {
-      configs.push({
-        name: "pagerduty",
-        transport: "streamable-http",
-        url: "https://mcp.pagerduty.com/mcp",
-        headers: {
-          Authorization: `Token token=${pagerdutyKey}`,
-        },
-      });
+    // PagerDuty MCP Server (streamable-http) — uses first configured instance
+    const pdInstances = Setting.getInstances(this.accountId, "pagerduty");
+    if (pdInstances.length > 0) {
+      const pd = pdInstances[0];
+      if (pd.api_key) {
+        configs.push({
+          name: "pagerduty",
+          transport: "streamable-http",
+          url: "https://mcp.pagerduty.com/mcp",
+          headers: {
+            Authorization: `Token token=${pd.api_key}`,
+          },
+        });
+      }
     }
 
     return configs;

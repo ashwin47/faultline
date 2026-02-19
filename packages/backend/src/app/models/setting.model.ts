@@ -1,22 +1,21 @@
-import { eq, and } from 'drizzle-orm';
+import { eq, and, like } from 'drizzle-orm';
 import { getDatabase, getEncryptionKey } from '../../config/database';
 import { settings } from '../../db/schema';
 import { encrypt, decrypt, maskValue } from '../../lib/utils/encryption';
 import type { Settings, IntegrationStatus } from '../../types/index';
 
 export class Setting {
-  private static readonly ENCRYPTED_KEYS = [
-    'openai.api_key',
-    'newrelic.api_key',
-    'sentry.auth_token',
-    'aws.access_key_id',
-    'aws.secret_access_key',
-    'github.token',
-    'pagerduty.api_key',
+  /** Suffixes that indicate a value should be encrypted at rest. */
+  private static readonly ENCRYPTED_SUFFIXES = [
+    '.api_key',
+    '.auth_token',
+    '.access_key_id',
+    '.secret_access_key',
+    '.token',
   ];
 
   private static shouldEncrypt(key: string): boolean {
-    return Setting.ENCRYPTED_KEYS.includes(key);
+    return Setting.ENCRYPTED_SUFFIXES.some(suffix => key.endsWith(suffix));
   }
 
   private static validateApiKey(key: string, value: string): void {
@@ -163,16 +162,98 @@ export class Setting {
   }
 
   static integrationStatus(accountId: string): IntegrationStatus {
-    const allSettings = Setting.all(accountId, false);
+    const keys = Object.keys(Setting.all(accountId, false));
 
     return {
-      openai: !!allSettings['openai.api_key'],
-      newrelic: !!allSettings['newrelic.api_key'] && !!allSettings['newrelic.account_id'],
-      sentry: !!allSettings['sentry.auth_token'] && !!allSettings['sentry.org'],
-      aws: !!allSettings['aws.access_key_id'] && !!allSettings['aws.secret_access_key'],
-      github: !!allSettings['github.token'] && !!allSettings['github.owner'] && !!allSettings['github.repo'],
-      pagerduty: !!allSettings['pagerduty.api_key'],
+      openai: keys.includes('openai.api_key'),
+      newrelic: keys.some(k => /^newrelic\.\d+\.api_key$/.test(k)),
+      sentry: keys.some(k => /^sentry\.\d+\.auth_token$/.test(k)),
+      aws: keys.some(k => /^aws\.\d+\.access_key_id$/.test(k)),
+      github: keys.some(k => /^github\.\d+\.token$/.test(k)),
+      pagerduty: keys.some(k => /^pagerduty\.\d+\.api_key$/.test(k)),
     };
+  }
+
+  /**
+   * Get all instances for an integration prefix.
+   * Returns an array of { field: value } objects, one per indexed instance.
+   * e.g. getInstances(accountId, 'sentry') returns
+   *   [{ auth_token: '...', org: '...' }, { auth_token: '...', org: '...' }]
+   */
+  static getInstances(accountId: string, integration: string): Record<string, string>[] {
+    const db = getDatabase();
+    const encryptionKey = getEncryptionKey();
+    const rows = db
+      .select({ key: settings.key, value: settings.value, isEncrypted: settings.isEncrypted })
+      .from(settings)
+      .where(and(eq(settings.accountId, accountId), like(settings.key, `${integration}.%`)))
+      .all();
+
+    const instances = new Map<number, Record<string, string>>();
+    const pattern = new RegExp(`^${integration.replace('.', '\\.')}\\.(\\d+)\\.(.+)$`);
+
+    for (const row of rows) {
+      const match = row.key.match(pattern);
+      if (!match) continue;
+
+      const index = parseInt(match[1]);
+      const field = match[2];
+      let value = row.value;
+
+      if (row.isEncrypted) {
+        try {
+          value = decrypt(value, encryptionKey);
+        } catch {
+          continue;
+        }
+      }
+
+      if (!instances.has(index)) instances.set(index, {});
+      instances.get(index)![field] = value;
+    }
+
+    return [...instances.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([, fields]) => fields);
+  }
+
+  /**
+   * Delete all keys for a specific integration instance and reindex higher instances.
+   */
+  static deleteInstance(accountId: string, integration: string, index: number): void {
+    const db = getDatabase();
+    const prefix = `${integration}.${index}.`;
+
+    db.transaction((tx) => {
+      // Delete all keys for this instance
+      const allRows = tx
+        .select({ id: settings.id, key: settings.key })
+        .from(settings)
+        .where(and(eq(settings.accountId, accountId), like(settings.key, `${integration}.%`)))
+        .all();
+
+      for (const row of allRows) {
+        if (row.key.startsWith(prefix)) {
+          tx.delete(settings).where(eq(settings.id, row.id)).run();
+        }
+      }
+
+      // Reindex higher instances (N+1 → N, N+2 → N+1, etc.)
+      const pattern = new RegExp(`^${integration.replace('.', '\\.')}\\.(\\d+)\\.(.+)$`);
+      for (const row of allRows) {
+        const match = row.key.match(pattern);
+        if (!match) continue;
+
+        const oldIndex = parseInt(match[1]);
+        const field = match[2];
+        if (oldIndex <= index) continue;
+
+        tx.update(settings)
+          .set({ key: `${integration}.${oldIndex - 1}.${field}` })
+          .where(eq(settings.id, row.id))
+          .run();
+      }
+    });
   }
 
   static async testIntegration(accountId: string, integration: string): Promise<{ success: boolean; message: string }> {

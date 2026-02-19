@@ -96,6 +96,22 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
+  /**
+   * Delete an integration instance and refresh settings
+   */
+  async function deleteIntegrationInstance(integration: string, index: number) {
+    try {
+      await axios.delete(`${accountBase()}/settings/integrations/${integration}/${index}`);
+      await fetchSettings();
+      await fetchIntegrationStatus();
+      return true;
+    } catch (err: any) {
+      error.value = err.message || 'Failed to delete integration instance';
+      console.error('Error deleting integration instance:', err);
+      return false;
+    }
+  }
+
   return {
     settings,
     integrationStatus,
@@ -105,5 +121,6 @@ export const useSettingsStore = defineStore('settings', () => {
     fetchIntegrationStatus,
     updateSettings,
     testIntegration,
+    deleteIntegrationInstance,
   };
 });

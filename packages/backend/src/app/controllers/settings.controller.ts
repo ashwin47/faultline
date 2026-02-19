@@ -82,4 +82,35 @@ router.post('/test/:integration', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * DELETE /api/settings/integrations/:integration/:index
+ * Remove an integration instance and reindex remaining instances
+ */
+router.delete('/integrations/:integration/:index', (req: Request, res: Response) => {
+  try {
+    const accountId = req.params.accountId;
+    const { integration, index: indexStr } = req.params;
+    const index = parseInt(indexStr);
+
+    const validIntegrations = ['newrelic', 'sentry', 'aws', 'github', 'pagerduty'];
+    if (!validIntegrations.includes(integration)) {
+      res.status(400).json({ error: 'Invalid integration name' });
+      return;
+    }
+
+    if (isNaN(index) || index < 0) {
+      res.status(400).json({ error: 'Invalid index' });
+      return;
+    }
+
+    Setting.deleteInstance(accountId, integration, index);
+    logger.info({ integration, index }, 'Integration instance deleted');
+
+    res.json({ success: true });
+  } catch (error) {
+    logger.error({ error }, 'Error deleting integration instance');
+    res.status(500).json({ error: 'Failed to delete integration instance' });
+  }
+});
+
 export default router;

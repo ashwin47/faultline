@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -32,16 +33,38 @@ def _node(
     }
 
 
+def _get_instances(settings: dict[str, Any], integration: str) -> list[dict[str, str]]:
+    """Extract all indexed instances for an integration from settings.
+
+    Keys use the format integration.N.field (e.g. sentry.0.auth_token).
+    Returns a list of {field: value} dicts, one per instance, sorted by index.
+    """
+    pattern = re.compile(rf"^{re.escape(integration)}\.(\d+)\.(.+)$")
+    instances: dict[int, dict[str, str]] = {}
+
+    for key, value in settings.items():
+        m = pattern.match(key)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        field = m.group(2)
+        if idx not in instances:
+            instances[idx] = {}
+        instances[idx][field] = value
+
+    return [instances[i] for i in sorted(instances)]
+
+
 # ── New Relic ────────────────────────────────────────────────────
 
 
-async def _discover_newrelic(settings: dict[str, Any]) -> list[dict[str, Any]]:
-    api_key = settings.get("newrelic.0.api_key")
-    account_id = settings.get("newrelic.0.account_id")
+async def _discover_newrelic_instance(instance: dict[str, str]) -> list[dict[str, Any]]:
+    api_key = instance.get("api_key")
+    account_id = instance.get("account_id")
     if not api_key or not account_id:
         return []
 
-    region = settings.get("newrelic.0.region") or "us"
+    region = instance.get("region") or "us"
     url = (
         "https://api.eu.newrelic.com/graphql"
         if region == "eu"
@@ -120,17 +143,34 @@ async def _discover_newrelic(settings: dict[str, Any]) -> list[dict[str, Any]]:
         return []
 
 
+async def _discover_newrelic(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    instances = _get_instances(settings, "newrelic")
+    if not instances:
+        return []
+    results = await asyncio.gather(
+        *[_discover_newrelic_instance(inst) for inst in instances],
+        return_exceptions=True,
+    )
+    nodes: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning("New Relic instance discovery failed: %s", result)
+        else:
+            nodes.extend(result)
+    return nodes
+
+
 # ── AWS ──────────────────────────────────────────────────────────
 
 
-def _discover_aws_sync(settings: dict[str, Any]) -> list[dict[str, Any]]:
-    """Synchronous AWS discovery — runs in a thread to avoid blocking the event loop."""
-    access_key = settings.get("aws.0.access_key_id")
-    secret_key = settings.get("aws.0.secret_access_key")
+def _discover_aws_instance_sync(instance: dict[str, str]) -> list[dict[str, Any]]:
+    """Synchronous AWS discovery for a single instance."""
+    access_key = instance.get("access_key_id")
+    secret_key = instance.get("secret_access_key")
     if not access_key or not secret_key:
         return []
 
-    region = settings.get("aws.0.region") or "us-east-1"
+    region = instance.get("region") or "us-east-1"
 
     import boto3
 
@@ -217,16 +257,28 @@ def _discover_aws_sync(settings: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def _discover_aws(settings: dict[str, Any]) -> list[dict[str, Any]]:
-    return await asyncio.get_event_loop().run_in_executor(
-        None, _discover_aws_sync, settings
+    instances = _get_instances(settings, "aws")
+    if not instances:
+        return []
+    loop = asyncio.get_event_loop()
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, _discover_aws_instance_sync, inst) for inst in instances],
+        return_exceptions=True,
     )
+    nodes: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning("AWS instance discovery failed: %s", result)
+        else:
+            nodes.extend(result)
+    return nodes
 
 
 # ── PagerDuty ────────────────────────────────────────────────────
 
 
-async def _discover_pagerduty(settings: dict[str, Any]) -> list[dict[str, Any]]:
-    api_key = settings.get("pagerduty.0.api_key")
+async def _discover_pagerduty_instance(instance: dict[str, str]) -> list[dict[str, Any]]:
+    api_key = instance.get("api_key")
     if not api_key:
         return []
 
@@ -265,12 +317,29 @@ async def _discover_pagerduty(settings: dict[str, Any]) -> list[dict[str, Any]]:
         return []
 
 
+async def _discover_pagerduty(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    instances = _get_instances(settings, "pagerduty")
+    if not instances:
+        return []
+    results = await asyncio.gather(
+        *[_discover_pagerduty_instance(inst) for inst in instances],
+        return_exceptions=True,
+    )
+    nodes: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning("PagerDuty instance discovery failed: %s", result)
+        else:
+            nodes.extend(result)
+    return nodes
+
+
 # ── Sentry ───────────────────────────────────────────────────────
 
 
-async def _discover_sentry(settings: dict[str, Any]) -> list[dict[str, Any]]:
-    auth_token = settings.get("sentry.0.auth_token")
-    org = settings.get("sentry.0.org")
+async def _discover_sentry_instance(instance: dict[str, str]) -> list[dict[str, Any]]:
+    auth_token = instance.get("auth_token")
+    org = instance.get("org")
     if not auth_token or not org:
         return []
 
@@ -304,6 +373,23 @@ async def _discover_sentry(settings: dict[str, Any]) -> list[dict[str, Any]]:
     except Exception as exc:
         logger.warning("Sentry discovery failed: %s", exc)
         return []
+
+
+async def _discover_sentry(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    instances = _get_instances(settings, "sentry")
+    if not instances:
+        return []
+    results = await asyncio.gather(
+        *[_discover_sentry_instance(inst) for inst in instances],
+        return_exceptions=True,
+    )
+    nodes: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning("Sentry instance discovery failed: %s", result)
+        else:
+            nodes.extend(result)
+    return nodes
 
 
 # ── Edge inference ───────────────────────────────────────────────

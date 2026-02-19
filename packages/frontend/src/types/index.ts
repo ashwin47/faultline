@@ -32,36 +32,16 @@ export interface Conversation {
 }
 
 export interface Settings {
-  // OpenAI
+  // OpenAI (single instance)
   'openai.api_key'?: string;
-
-  // New Relic
-  'newrelic.api_key'?: string;
-  'newrelic.account_id'?: string;
-  'newrelic.region'?: string; // "us" (default) or "eu"
-  'newrelic.app_ids'?: string;
-
-  // Sentry
-  'sentry.auth_token'?: string;
-  'sentry.org'?: string;
-  'sentry.project'?: string;
-
-  // AWS
-  'aws.access_key_id'?: string;
-  'aws.secret_access_key'?: string;
-  'aws.region'?: string;
-
-  // GitHub
-  'github.token'?: string;
-  'github.owner'?: string;
-  'github.repo'?: string;
-
-  // PagerDuty
-  'pagerduty.api_key'?: string;
 
   // App settings
   'app.name'?: string;
   'app.version'?: string;
+
+  // Integration keys use indexed format: integration.N.field
+  // e.g. sentry.0.auth_token, aws.1.access_key_id
+  [key: string]: string | undefined;
 }
 
 export interface IntegrationStatus {

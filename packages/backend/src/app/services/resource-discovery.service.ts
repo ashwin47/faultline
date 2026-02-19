@@ -48,16 +48,31 @@ export class ResourceDiscoveryService {
 
   /**
    * Discover resources from all configured integrations, infer edges.
+   * Each integration can have multiple instances (accounts).
    */
   async syncAll(): Promise<{ nodes: ResourceNode[]; edges: ResourceEdge[] }> {
-    const status = Setting.integrationStatus(this.accountId);
-
     const discoveryTasks: Promise<ResourceNode[]>[] = [];
 
-    if (status.aws) discoveryTasks.push(this.discoverAws());
-    if (status.newrelic) discoveryTasks.push(this.discoverNewRelic());
-    if (status.pagerduty) discoveryTasks.push(this.discoverPagerDuty());
-    if (status.sentry) discoveryTasks.push(this.discoverSentry());
+    // Launch discovery for every instance of each integration
+    const awsInstances = Setting.getInstances(this.accountId, 'aws');
+    for (let i = 0; i < awsInstances.length; i++) {
+      discoveryTasks.push(this.discoverAws(i));
+    }
+
+    const nrInstances = Setting.getInstances(this.accountId, 'newrelic');
+    for (let i = 0; i < nrInstances.length; i++) {
+      discoveryTasks.push(this.discoverNewRelic(i));
+    }
+
+    const pdInstances = Setting.getInstances(this.accountId, 'pagerduty');
+    for (let i = 0; i < pdInstances.length; i++) {
+      discoveryTasks.push(this.discoverPagerDuty(i));
+    }
+
+    const sentryInstances = Setting.getInstances(this.accountId, 'sentry');
+    for (let i = 0; i < sentryInstances.length; i++) {
+      discoveryTasks.push(this.discoverSentry(i));
+    }
 
     const results = await Promise.allSettled(discoveryTasks);
 
@@ -97,9 +112,9 @@ export class ResourceDiscoveryService {
 
   // ── Private discovery methods ──
 
-  private async discoverAws(): Promise<ResourceNode[]> {
+  private async discoverAws(index: number): Promise<ResourceNode[]> {
     const nodes: ResourceNode[] = [];
-    const creds = getAwsCredentials(this.accountId);
+    const creds = getAwsCredentials(this.accountId, index);
     const credConfig = {
       region: creds.region,
       credentials: { accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey },
@@ -197,9 +212,9 @@ export class ResourceDiscoveryService {
     return nodes;
   }
 
-  private async discoverNewRelic(): Promise<ResourceNode[]> {
+  private async discoverNewRelic(index: number): Promise<ResourceNode[]> {
     // Verify credentials are available
-    getNewRelicCredentials(this.accountId);
+    getNewRelicCredentials(this.accountId, index);
 
     const data = await nerdgraph<any>(this.accountId, NR_ENTITY_QUERY, {
       query: "domain = 'APM' AND type = 'APPLICATION'",
@@ -224,9 +239,9 @@ export class ResourceDiscoveryService {
     }));
   }
 
-  private async discoverPagerDuty(): Promise<ResourceNode[]> {
+  private async discoverPagerDuty(index: number): Promise<ResourceNode[]> {
     // Verify credentials
-    getPagerDutyCredentials(this.accountId);
+    getPagerDutyCredentials(this.accountId, index);
 
     const services = await pdPaginate<any>(this.accountId, '/services', 'services');
 
@@ -245,9 +260,9 @@ export class ResourceDiscoveryService {
     }));
   }
 
-  private async discoverSentry(): Promise<ResourceNode[]> {
-    const authToken = Setting.get(this.accountId, 'sentry.auth_token');
-    const org = Setting.get(this.accountId, 'sentry.org');
+  private async discoverSentry(index: number): Promise<ResourceNode[]> {
+    const authToken = Setting.get(this.accountId, `sentry.${index}.auth_token`);
+    const org = Setting.get(this.accountId, `sentry.${index}.org`);
 
     if (!authToken || !org) return [];
 

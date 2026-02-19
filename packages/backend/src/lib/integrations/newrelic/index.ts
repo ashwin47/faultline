@@ -17,17 +17,18 @@ export interface NewRelicCredentials {
 
 /**
  * Read New Relic credentials from the settings database.
+ * Uses indexed key format (newrelic.N.field). Defaults to instance 0.
  * Throws if not configured.
  */
-export function getNewRelicCredentials(accountId: string): NewRelicCredentials {
-  const apiKey = Setting.get(accountId, 'newrelic.api_key');
-  const nrAccountId = Setting.get(accountId, 'newrelic.account_id');
+export function getNewRelicCredentials(accountId: string, index = 0): NewRelicCredentials {
+  const apiKey = Setting.get(accountId, `newrelic.${index}.api_key`);
+  const nrAccountId = Setting.get(accountId, `newrelic.${index}.account_id`);
 
   if (!apiKey || !nrAccountId) {
     throw new Error('New Relic API key or account ID not configured. Please enter them in Settings.');
   }
 
-  const region = Setting.get(accountId, 'newrelic.region') || 'us';
+  const region = Setting.get(accountId, `newrelic.${index}.region`) || 'us';
 
   return { apiKey, accountId: nrAccountId, region };
 }

@@ -32,12 +32,13 @@ export interface AwsCredentials {
 
 /**
  * Read AWS credentials from the settings database.
+ * Uses indexed key format (aws.N.field). Defaults to instance 0.
  * Throws if credentials are not configured.
  */
-export function getAwsCredentials(accountId: string): AwsCredentials {
-  const accessKeyId = Setting.get(accountId, 'aws.access_key_id');
-  const secretAccessKey = Setting.get(accountId, 'aws.secret_access_key');
-  const region = Setting.get(accountId, 'aws.region') || 'us-east-1';
+export function getAwsCredentials(accountId: string, index = 0): AwsCredentials {
+  const accessKeyId = Setting.get(accountId, `aws.${index}.access_key_id`);
+  const secretAccessKey = Setting.get(accountId, `aws.${index}.secret_access_key`);
+  const region = Setting.get(accountId, `aws.${index}.region`) || 'us-east-1';
 
   if (!accessKeyId || !secretAccessKey) {
     throw new Error('AWS credentials not configured. Please enter your AWS Access Key and Secret Key in Settings.');
