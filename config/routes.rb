@@ -6,6 +6,9 @@ Rails.application.routes.draw do
   get 'api/health', to: proc { [200, { 'Content-Type' => 'application/json' }, ['{"status":"ok"}']] }
 
   namespace :api do
+    # Webhooks (unauthenticated — token-based)
+    post 'webhooks/pagerduty/:token', to: 'webhooks#pagerduty'
+
     # Auth routes (public — no account scope)
     scope 'auth', controller: :auth do
       post 'signup'

@@ -126,6 +126,27 @@
                     </template>
                     <p v-if="def.hint" class="text-xs text-black/50 dark:text-white/50 mt-2">{{ def.hint }}</p>
 
+                    <!-- Webhook URL (PagerDuty) -->
+                    <div v-if="getWebhookUrl(def.id, idx)" class="mt-3">
+                      <label class="block text-xs font-medium mb-1.5">Webhook URL</label>
+                      <div class="flex items-center gap-2">
+                        <input
+                          type="text"
+                          :value="getWebhookUrl(def.id, idx)"
+                          readonly
+                          class="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-700 text-sm bg-black/5 dark:bg-white/5 text-black/70 dark:text-white/70 font-mono"
+                        />
+                        <button
+                          type="button"
+                          @click="copyWebhookUrl(def.id, idx)"
+                          class="px-3 py-2 border border-gray-300 dark:border-gray-700 text-xs hover:bg-black/5 dark:hover:bg-white/5 transition-colors shrink-0"
+                        >
+                          {{ copiedWebhook === `${def.id}.${idx}` ? 'Copied!' : 'Copy' }}
+                        </button>
+                      </div>
+                      <p class="text-xs text-black/40 dark:text-white/40 mt-1">Add this URL to PagerDuty → Integrations → Generic Webhooks (V3) to auto-investigate incidents.</p>
+                    </div>
+
                     <!-- Remove button -->
                     <div class="flex justify-end mt-2" v-if="getInstanceIndices(def.id).length > 1">
                       <button
@@ -165,7 +186,7 @@ import { Icon } from '@iconify/vue';
 import SettingSection from './SettingSection.vue';
 import SettingInput from './SettingInput.vue';
 import WorkspaceSettings from './WorkspaceSettings.vue';
-import type { Settings, IntegrationStatus } from '../types';
+import type { Settings, IntegrationStatus, WebhookInfo } from '../types';
 
 // ── Integration schema definitions ──
 
@@ -284,6 +305,7 @@ function setTab(id: TabId) {
 }
 
 const formData = ref<Settings>({});
+const copiedWebhook = ref<string | null>(null);
 const savingSection = ref<string | null>(null);
 const sectionStatus = reactive<Record<string, string>>({});
 const sectionError = reactive<Record<string, boolean>>({});
@@ -371,6 +393,24 @@ function instanceConnected(def: IntegrationDef, index: number): boolean {
   const key = `${def.id}.${index}.${requiredField.key}`;
   const val = settingsStore.settings[key];
   return !!val && val !== '';
+}
+
+function getWebhookUrl(integrationId: string, index: number): string | null {
+  const webhook = settingsStore.webhooks.find(
+    (w: WebhookInfo) => w.integration === integrationId && w.integrationIndex === index,
+  );
+  if (!webhook) return null;
+  return `${window.location.origin}${webhook.url}`;
+}
+
+function copyWebhookUrl(integrationId: string, index: number) {
+  const url = getWebhookUrl(integrationId, index);
+  if (!url) return;
+  navigator.clipboard.writeText(url);
+  copiedWebhook.value = `${integrationId}.${index}`;
+  setTimeout(() => {
+    copiedWebhook.value = null;
+  }, 2000);
 }
 
 // ── Save logic ──

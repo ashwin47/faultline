@@ -2,7 +2,7 @@ import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import axios from 'axios';
 import { useAuthStore } from './auth';
-import type { Settings, IntegrationStatus } from '../types';
+import type { Settings, IntegrationStatus, WebhookInfo } from '../types';
 
 export const useSettingsStore = defineStore('settings', () => {
   const settings = ref<Settings>({});
@@ -14,6 +14,7 @@ export const useSettingsStore = defineStore('settings', () => {
     github: false,
     pagerduty: false,
   });
+  const webhooks = ref<WebhookInfo[]>([]);
   const loading = ref(false);
   const error = ref<string | null>(null);
 
@@ -47,6 +48,7 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       const response = await axios.get(`${accountBase()}/settings/status`);
       integrationStatus.value = response.data.integrations;
+      webhooks.value = response.data.webhooks || [];
     } catch (err: any) {
       console.error('Error fetching integration status:', err);
     }
@@ -115,6 +117,7 @@ export const useSettingsStore = defineStore('settings', () => {
   return {
     settings,
     integrationStatus,
+    webhooks,
     loading,
     error,
     fetchSettings,

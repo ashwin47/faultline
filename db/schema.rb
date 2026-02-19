@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_02_18_000002) do
+ActiveRecord::Schema[8.1].define(version: 2026_02_18_000003) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pgcrypto"
@@ -43,6 +43,17 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_18_000002) do
     t.datetime "updated_at", null: false
     t.index ["account_id"], name: "index_conversations_on_account_id"
     t.index ["created_at"], name: "index_conversations_on_created_at"
+  end
+
+  create_table "integration_webhooks", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
+    t.uuid "account_id", null: false
+    t.datetime "created_at", null: false
+    t.string "integration", null: false
+    t.integer "integration_index", default: 0, null: false
+    t.string "token", null: false
+    t.datetime "updated_at", null: false
+    t.index ["account_id", "integration", "integration_index"], name: "idx_webhooks_account_integration_index", unique: true
+    t.index ["token"], name: "index_integration_webhooks_on_token", unique: true
   end
 
   create_table "messages", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|

@@ -52,6 +52,12 @@ export interface IntegrationStatus {
   pagerduty: boolean;
 }
 
+export interface WebhookInfo {
+  integration: string;
+  integrationIndex: number;
+  url: string;
+}
+
 // Auth types
 export interface AuthUser {
   id: string;

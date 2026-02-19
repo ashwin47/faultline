@@ -4,6 +4,7 @@ class Account < ApplicationRecord
   has_many :settings, dependent: :destroy
   has_many :conversations, dependent: :destroy
   has_many :resource_maps, dependent: :destroy
+  has_many :integration_webhooks, dependent: :destroy
   has_many :workspace_invites, dependent: :destroy
 
   validates :name, presence: true
